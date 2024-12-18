@@ -1,8 +1,8 @@
 package maven
 
 import (
-	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/bazel"
 	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/maven/multiset"
@@ -11,8 +11,27 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// NoExternalImportsError represents the error when no external imports are found.
+type NoExternalImportsError struct {
+	PackageName string
+}
+
+func (e *NoExternalImportsError) Error() string {
+	return fmt.Sprintf("no external imports found for %s", e.PackageName)
+}
+
+// MultipleExternalImportsError represents the error when multiple possible external imports are found.
+type MultipleExternalImportsError struct {
+	PackageName      string
+	PossiblePackages []string
+}
+
+func (e *MultipleExternalImportsError) Error() string {
+	return fmt.Sprintf("multiple external imports found for %s; %v", e.PackageName, e.PossiblePackages)
+}
+
 type Resolver interface {
-	Resolve(pkg types.PackageName) (label.Label, error)
+	Resolve(pkg types.PackageName, excludedArtifacts map[string]struct{}, mavenRepositoryName string) (label.Label, error)
 }
 
 // resolver finds Maven provided packages by reading the maven_install.json
@@ -22,7 +41,7 @@ type resolver struct {
 	logger zerolog.Logger
 }
 
-func NewResolver(installFile string, excludedArtifacts map[string]struct{}, logger zerolog.Logger) (Resolver, error) {
+func NewResolver(installFile string, logger zerolog.Logger) (Resolver, error) {
 	r := resolver{
 		data:   multiset.NewStringMultiSet(),
 		logger: logger.With().Str("_c", "maven-resolver").Logger(),
@@ -43,46 +62,49 @@ func NewResolver(installFile string, excludedArtifacts map[string]struct{}, logg
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse coordinate %v: %w", coords, err)
 		}
-		l := label.New("maven", "", bazel.CleanupLabel(coords.ArtifactString()))
-		if _, found := excludedArtifacts[l.String()]; found {
-			continue
-		}
 		for _, pkg := range c.ListDependencyPackages(depName) {
-			r.data.Add(pkg, l.String())
+			r.data.Add(pkg, coords.ArtifactString())
 		}
 	}
 
 	return &r, nil
 }
 
-func (r *resolver) Resolve(pkg types.PackageName) (label.Label, error) {
+func (r *resolver) Resolve(pkg types.PackageName, excludedArtifacts map[string]struct{}, mavenRepositoryName string) (label.Label, error) {
 	v, found := r.data.Get(pkg.Name)
 	if !found {
-		return label.NoLabel, fmt.Errorf("package not found: %s", pkg)
+		return label.NoLabel, &NoExternalImportsError{PackageName: pkg.Name}
 	}
 
-	switch len(v) {
+	var filtered []string
+	for k := range v {
+		if _, excluded := excludedArtifacts[LabelFromArtifact(mavenRepositoryName, k).String()]; excluded {
+			continue
+		}
+		filtered = append(filtered, LabelFromArtifact(mavenRepositoryName, k).String())
+	}
+	sort.Strings(filtered)
+
+	switch len(filtered) {
 	case 0:
-		return label.NoLabel, errors.New("no external imports")
+		return label.NoLabel, &NoExternalImportsError{PackageName: pkg.Name}
 
 	case 1:
 		var ret string
-		for r := range v {
+		for _, r := range filtered {
 			ret = r
 			break
 		}
 		return label.Parse(ret)
 
 	default:
-		r.logger.Error().Msg("Append one of the following to BUILD.bazel:")
-		for k := range v {
-			r.logger.Error().Msgf("# gazelle:resolve java %s %s", pkg, k)
+		return label.NoLabel, &MultipleExternalImportsError{
+			PackageName:      pkg.Name,
+			PossiblePackages: filtered,
 		}
-
-		return label.NoLabel, errors.New("many possible imports")
 	}
 }
 
-func LabelFromArtifact(artifact string) label.Label {
-	return label.New("maven", "", bazel.CleanupLabel(artifact))
+func LabelFromArtifact(mavenRepositoryName string, artifact string) label.Label {
+	return label.New(mavenRepositoryName, "", bazel.CleanupLabel(artifact))
 }

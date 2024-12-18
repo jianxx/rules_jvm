@@ -1,0 +1,1 @@
+{"level":"fatal","step":"GenerateRules","rel":"src/main/com/example","error":"InvalidArgument: Expected exactly one java package, but saw 2: com.example, example","package":"src/main/com/example","message":"Failed to parse package"}

@@ -1,3 +1,4 @@
+load("@rules_java//java:defs.bzl", "java_test")
 load("@rules_jvm_external//:defs.bzl", "artifact")
 load("//java:defs.bzl", "java_junit5_test", "java_test_suite", "junit5_deps", "junit5_vintage_deps")
 
@@ -16,23 +17,44 @@ SHARDING_TEST = [
     "ShardingTest.java",
 ]
 
+VINTAGE_NESTED_TEST = [
+    "NestedClassesVintageTest.java",
+]
+
 java_test_suite(
     name = "small-tests",
     size = "small",
     srcs = glob(
         ["*.java"],
-        exclude = PACKAGE_NAME_TEST + PARALLEL_TEST + SHARDING_TEST,
+        exclude = PACKAGE_NAME_TEST + PARALLEL_TEST + SHARDING_TEST + VINTAGE_NESTED_TEST,
     ),
     exclude_engines = ["junit-vintage"],
     include_engines = ["junit-jupiter"],
     runner = "junit5",
+    test_suffixes_excludes = ["BaseTest.java"],
     deps = [
         "//java/src/com/github/bazel_contrib/contrib_rules_jvm/junit5",
         artifact("com.github.spotbugs:spotbugs-annotations", "contrib_rules_jvm_deps"),
         artifact("org.junit.jupiter:junit-jupiter-api", "contrib_rules_jvm_tests"),
+        artifact("org.junit.jupiter:junit-jupiter-params", "contrib_rules_jvm_tests"),
         artifact("org.junit.platform:junit-platform-engine", "contrib_rules_jvm_tests"),
+        artifact("org.junit.platform:junit-platform-testkit", "contrib_rules_jvm_tests"),
         artifact("org.mockito:mockito-core", "contrib_rules_jvm_tests"),
         artifact("org.opentest4j:opentest4j", "contrib_rules_jvm_tests"),
+    ] + junit5_vintage_deps("contrib_rules_jvm_tests"),
+)
+
+java_test_suite(
+    name = "vintage-nested-test",
+    size = "small",
+    srcs = [
+        "NestedClassesVintageTest.java",
+    ],
+    exclude_engines = ["junit-jupiter"],
+    include_engines = ["junit-vintage"],
+    runner = "junit5",
+    deps = [
+        "//java/src/com/github/bazel_contrib/contrib_rules_jvm/junit5",
     ] + junit5_vintage_deps("contrib_rules_jvm_tests"),
 )
 

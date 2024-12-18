@@ -10,10 +10,13 @@ import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -86,6 +89,14 @@ public class ClasspathParserTest {
         List.of(testFiles.get("/workspace/com/gazelle/java/javaparser/generators/Main.java"));
     parser.parseClasses(files);
     assertEquals(Set.of("workspace.com.gazelle.java.javaparser.generators"), parser.getPackages());
+  }
+
+  @Test
+  public void verifyNoPackageWithAnnotation() throws IOException {
+    List<? extends JavaFileObject> files =
+        List.of(testFiles.get("/workspace/com/gazelle/java/javaparser/generators/NoPackage.java"));
+    parser.parseClasses(files);
+    assertEquals(Set.of(), parser.getPackages());
   }
 
   @Test
@@ -191,8 +202,78 @@ public class ClasspathParserTest {
     assertEquals(
         Map.of(
             "workspace.com.gazelle.java.javaparser.generators.AnnotationAfterImport",
-            treeSet("com.example.FlakyTest")),
-        parser.getAnnotatedClasses());
+            new ClasspathParser.PerClassData(
+                treeSet("com.example.FlakyTest"), new TreeMap<>(), new TreeMap<>())),
+        parser.perClassData);
+  }
+
+  @Test
+  public void testAnnotationAfterImportOnNestedClass() throws IOException {
+    List<? extends JavaFileObject> files =
+        List.of(
+            testFiles.get(
+                "/workspace/com/gazelle/java/javaparser/generators/NestedClassAnnotations.java"));
+    parser.parseClasses(files);
+
+    assertEquals(
+        Map.of(
+            "workspace.com.gazelle.java.javaparser.generators.NestedClassAnnotations.Inner",
+            new ClasspathParser.PerClassData(
+                treeSet("com.example.FlakyTest"), new TreeMap<>(), new TreeMap<>())),
+        parser.perClassData);
+  }
+
+  @Test
+  public void testAnnotationOnField() throws IOException {
+    List<? extends JavaFileObject> files =
+        List.of(
+            testFiles.get(
+                "/workspace/com/gazelle/java/javaparser/generators/AnnotationOnField.java"));
+    parser.parseClasses(files);
+
+    TreeMap<String, SortedSet<String>> expectedOuterClassFieldAnnotations = new TreeMap<>();
+    expectedOuterClassFieldAnnotations.put("someField", treeSet("lombok.Getter"));
+
+    TreeMap<String, SortedSet<String>> expectedInnerClassFieldAnnotations = new TreeMap<>();
+    expectedInnerClassFieldAnnotations.put("canBeSet", treeSet("lombok.Setter"));
+
+    TreeMap<String, SortedSet<String>> expectedInnerEnumFieldAnnotations = new TreeMap<>();
+    expectedInnerEnumFieldAnnotations.put("size", treeSet("lombok.Getter"));
+
+    TreeMap<String, ClasspathParser.PerClassData> expected = new TreeMap<>();
+    expected.put(
+        "workspace.com.gazelle.java.javaparser.generators.AnnotationOnField",
+        new ClasspathParser.PerClassData(
+            new TreeSet<>(), new TreeMap<>(), expectedOuterClassFieldAnnotations));
+    expected.put(
+        "workspace.com.gazelle.java.javaparser.generators.AnnotationOnField.InnerClass",
+        new ClasspathParser.PerClassData(
+            new TreeSet<>(), new TreeMap<>(), expectedInnerClassFieldAnnotations));
+    expected.put(
+        "workspace.com.gazelle.java.javaparser.generators.AnnotationOnField.InnerEnum",
+        new ClasspathParser.PerClassData(
+            new TreeSet<>(), new TreeMap<>(), expectedInnerEnumFieldAnnotations));
+
+    assertEquals(expected, parser.perClassData);
+  }
+
+  @Test
+  public void testAnnotationAfterImportOnMethod() throws IOException {
+    List<? extends JavaFileObject> files =
+        List.of(
+            testFiles.get(
+                "/workspace/com/gazelle/java/javaparser/generators/AnnotationAfterImportOnMethod.java"));
+    parser.parseClasses(files);
+
+    TreeMap<String, SortedSet<String>> expectedPerMethodAnnotations = new TreeMap<>();
+    expectedPerMethodAnnotations.put("someTest", treeSet("org.junit.jupiter.api.Test"));
+
+    assertEquals(
+        Map.of(
+            "workspace.com.gazelle.java.javaparser.generators.AnnotationAfterImportOnMethod",
+            new ClasspathParser.PerClassData(
+                new TreeSet<>(), expectedPerMethodAnnotations, new TreeMap<>())),
+        parser.perClassData);
   }
 
   @Test
@@ -208,8 +289,9 @@ public class ClasspathParserTest {
     assertEquals(
         Map.of(
             "workspace.com.gazelle.java.javaparser.generators.AnnotationFromJavaStandardLibrary",
-            treeSet("Deprecated")),
-        parser.getAnnotatedClasses());
+            new ClasspathParser.PerClassData(
+                treeSet("Deprecated"), new TreeMap<>(), new TreeMap<>())),
+        parser.perClassData);
   }
 
   @Test
@@ -225,8 +307,9 @@ public class ClasspathParserTest {
     assertEquals(
         Map.of(
             "workspace.com.gazelle.java.javaparser.generators.AnnotationWithoutImport",
-            treeSet("WhoKnowsWhereIAmFrom")),
-        parser.getAnnotatedClasses());
+            new ClasspathParser.PerClassData(
+                treeSet("WhoKnowsWhereIAmFrom"), new TreeMap<>(), new TreeMap<>())),
+        parser.perClassData);
   }
 
   @Test
@@ -255,10 +338,21 @@ public class ClasspathParserTest {
                 "/workspace/com/gazelle/java/javaparser/generators/AnonymousInnerClass.java"));
     parser.parseClasses(files);
 
-    Set<String> expected =
+    Set<String> expectedTypes =
         Set.of(
             "java.util.HashMap", "javax.annotation.Nullable", "org.jetbrains.annotations.Nullable");
-    assertEquals(expected, parser.getUsedTypes());
+    assertEquals(expectedTypes, parser.getUsedTypes());
+
+    Map<String, ClasspathParser.PerClassData> expectedPerClassMetadata = new TreeMap<>();
+    TreeMap<String, SortedSet<String>> expectedPerMethodAnnotations = new TreeMap<>();
+    expectedPerMethodAnnotations.put(
+        "containsValue", treeSet("Override", "javax.annotation.Nullable"));
+    // This anonymous inner class really has a name like $1, but we don't know what number it will
+    // end up getting given, so we just use the empty string for anonymous inner classes.
+    expectedPerClassMetadata.put(
+        "workspace.com.gazelle.java.javaparser.generators.AnonymousInnerClass.",
+        new ClasspathParser.PerClassData(treeSet(), expectedPerMethodAnnotations, new TreeMap<>()));
+    assertEquals(expectedPerClassMetadata, parser.perClassData);
   }
 
   @Test
@@ -305,11 +399,7 @@ public class ClasspathParserTest {
   }
 
   private <T> TreeSet<T> treeSet(T... values) {
-    TreeSet<T> set = new TreeSet<>();
-    for (T value : values) {
-      set.add(value);
-    }
-    return set;
+    return new TreeSet<>(Arrays.asList(values));
   }
 
   @edu.umd.cs.findbugs.annotations.SuppressFBWarnings(

@@ -8,9 +8,11 @@ import (
 	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/java"
 	pb "github.com/bazel-contrib/rules_jvm/java/gazelle/private/javaparser/proto/gazelle/java/javaparser/v0"
 	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/servermanager"
+	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/sorted_multiset"
 	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/sorted_set"
 	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/types"
 	"github.com/rs/zerolog"
+	"google.golang.org/grpc/status"
 )
 
 type Runner struct {
@@ -53,13 +55,49 @@ func (r Runner) ParsePackage(ctx context.Context, in *ParsePackageRequest) (*jav
 
 	resp, err := r.rpc.ParsePackage(ctx, &pb.ParsePackageRequest{Rel: in.Rel, Files: in.Files})
 	if err != nil {
+		if grpcErr, ok := status.FromError(err); ok {
+			// gRPC is an implementation detail of the javaparser layer, and shouldn't be relied on by higher layers.
+			// Reformat gRPC-related details here, for more clear error messages.
+			return nil, fmt.Errorf("%s: %s", grpcErr.Code().String(), grpcErr.Message())
+		}
 		return nil, err
 	}
 
 	perClassMetadata := make(map[string]java.PerClassMetadata, len(resp.GetPerClassMetadata()))
 	for k, v := range resp.GetPerClassMetadata() {
+		annotationClassNames := sorted_set.NewSortedSetFn(nil, types.ClassNameLess)
+		for _, annotation := range v.GetAnnotationClassNames() {
+			annotationClassName, err := types.ParseClassName(annotation)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse annotation name %q as a class name in %s: %w", k, annotation, err)
+			}
+			annotationClassNames.Add(*annotationClassName)
+		}
+
+		methodAnnotationClassNames := sorted_multiset.NewSortedMultiSetFn[string, types.ClassName](types.ClassNameLess)
+		for method, perMethod := range v.GetPerMethodMetadata() {
+			for _, annotation := range perMethod.AnnotationClassNames {
+				annotationClassName, err := types.ParseClassName(annotation)
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse annotation name %q as a class name in %s: %w", k, annotation, err)
+				}
+				methodAnnotationClassNames.Add(method, *annotationClassName)
+			}
+		}
+		fieldAnnotationClassNames := sorted_multiset.NewSortedMultiSetFn[string, types.ClassName](types.ClassNameLess)
+		for field, perField := range v.GetPerFieldMetadata() {
+			for _, annotation := range perField.AnnotationClassNames {
+				annotationClassName, err := types.ParseClassName(annotation)
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse annotation name %q as a class name in %s: %w", k, annotation, err)
+				}
+				fieldAnnotationClassNames.Add(field, *annotationClassName)
+			}
+		}
 		metadata := java.PerClassMetadata{
-			AnnotationClassNames: sorted_set.NewSortedSet(v.GetAnnotationClassNames()),
+			AnnotationClassNames:       annotationClassNames,
+			MethodAnnotationClassNames: methodAnnotationClassNames,
+			FieldAnnotationClassNames:  fieldAnnotationClassNames,
 		}
 		perClassMetadata[k] = metadata
 	}
@@ -97,7 +135,7 @@ func (r Runner) ParsePackage(ctx context.Context, in *ParsePackageRequest) (*jav
 		ImportedPackagesWithoutSpecificClasses: importedPackages,
 		Mains:                                  mains,
 		Files:                                  sorted_set.NewSortedSet(in.Files),
-		TestPackage:                            java.IsTestPath(in.Rel),
+		TestPackage:                            java.IsTestPackage(in.Rel),
 		PerClassMetadata:                       perClassMetadata,
 	}, nil
 }

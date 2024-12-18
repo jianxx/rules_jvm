@@ -1,0 +1,40 @@
+name: Gazelle Examples
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  gazelle_examples:
+    strategy:
+      matrix:
+        runs-on:
+          - ubuntu-latest
+          - windows-latest
+
+    runs-on: ${{ matrix.runs-on }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      # The windows-latest image comes with Java 8 but rules_jvm_external requires at least 11, so we install a newer JDK.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "21"
+
+      - uses: bazel-contrib/setup-bazel@0.8.5
+        with:
+          # Avoid downloading Bazel every time.
+          bazelisk-cache: true
+          # Store build cache per workflow.
+          disk-cache: true
+          # Share repository cache between workflows.
+          repository-cache: true
+
+      - name: bzlmod gazelle
+        run: (cd examples/gazelle && bazelisk --bazelrc=../../.github/workflows/ci.bazelrc run --enable_bzlmod //:gazelle && bazelisk --bazelrc=../../.github/workflows/ci.bazelrc test --enable_bzlmod //...)

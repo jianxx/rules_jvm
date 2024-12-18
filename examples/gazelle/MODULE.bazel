@@ -1,0 +1,50 @@
+module(
+    name = "gazelle_example",
+    version = "0.0.0",
+)
+
+bazel_dep(
+    name = "contrib_rules_jvm",
+    version = "0.0.0",
+)
+local_path_override(
+    module_name = "contrib_rules_jvm",
+    path = "../..",
+)
+
+bazel_dep(
+    name = "bazel_skylib",
+    version = "1.5.0",
+)
+bazel_dep(
+    name = "rules_jvm_external",
+    version = "6.2",
+)
+
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(
+    name = "maven",
+    artifacts = [
+        "org.junit.jupiter:junit-jupiter-api:5.8.2",
+        "org.junit.jupiter:junit-jupiter-engine:5.8.2",
+        "org.junit.platform:junit-platform-launcher:1.8.2",
+        "org.junit.platform:junit-platform-reporting:1.8.2",
+    ],
+    fetch_sources = True,
+    lock_file = "//:maven_install.json",
+)
+use_repo(
+    maven,
+    "maven",
+    "unpinned_maven",
+)
+
+bazel_dep(
+    name = "gazelle",
+    version = "0.36.0",
+)
+git_override(
+    module_name = "gazelle",
+    commit = "ba2ce367a545e0bdd74a7abca40ef5e0a0cb8dcb",
+    remote = "https://github.com/bazelbuild/bazel-gazelle.git",
+)

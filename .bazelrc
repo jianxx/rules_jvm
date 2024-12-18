@@ -1,7 +1,5 @@
 # Settings that apply only to CI are in .github/workflows/ci.bazelrc
 
-build --enable_bzlmod
-
 # Pin java versions
 build:jdk11 --java_runtime_version=remotejdk_11
 build:jdk11 --java_language_version=11
@@ -16,6 +14,8 @@ build --tool_java_language_version=17
 # Make sure we get something helpful when tests fail
 test --verbose_failures
 test --test_output=errors
+
+import %workspace%/.bazelrc.windows
 
 # Load any settings specific to the current user.
 try-import %workspace%/.bazelrc.user

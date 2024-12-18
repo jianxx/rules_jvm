@@ -1,0 +1,33 @@
+name: Examples
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  examples:
+    strategy:
+      matrix:
+        runs-on:
+          - ubuntu-latest
+
+    runs-on: ${{ matrix.runs-on }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: bazel-contrib/setup-bazel@0.8.5
+        with:
+          # Avoid downloading Bazel every time.
+          bazelisk-cache: true
+          # Store build cache per workflow.
+          disk-cache: true
+          # Share repository cache between workflows.
+          repository-cache: true
+
+      - name: bzlmod tests and lints
+        run: (cd examples/tests_and_lints && bazel --bazelrc=../../.github/workflows/ci.bazelrc test --enable_bzlmod //...)

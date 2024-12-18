@@ -1,38 +1,53 @@
 package com.github.bazel_contrib.contrib_rules_jvm.junit5;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static java.util.stream.Collectors.collectingAndThen;
-import static java.util.stream.Collectors.toCollection;
 
 import java.io.BufferedWriter;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Collections;
-import java.util.LinkedHashSet;
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import javax.xml.stream.XMLOutputFactory;
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamWriter;
 import org.junit.platform.engine.TestExecutionResult;
+import org.junit.platform.engine.UniqueId;
 import org.junit.platform.engine.reporting.ReportEntry;
 import org.junit.platform.launcher.TestExecutionListener;
 import org.junit.platform.launcher.TestIdentifier;
 import org.junit.platform.launcher.TestPlan;
 
 public class BazelJUnitOutputListener implements TestExecutionListener, Closeable {
-
-  private static final Logger LOG = Logger.getLogger(BazelJUnitOutputListener.class.getName());
+  public static final Logger LOG = Logger.getLogger(BazelJUnitOutputListener.class.getName());
   private final XMLStreamWriter xml;
-  private Set<RootContainer> roots;
+
+  private final Object resultsLock = new Object();
+  // Commented out to avoid adding a dependency to building the test runner.
+  // This is really just documentation until someone actually turns on a static analyser.
+  // If they do, we can decide whether we want to pick up the dependency.
+  // @GuardedBy("resultsLock")
+  private final Map<UniqueId, TestData> results = new ConcurrentHashMap<>();
+  private TestPlan testPlan;
+
+  // If we have already closed this listener, we shouldn't write any more XML.
+  private final AtomicBoolean hasClosed = new AtomicBoolean();
+  // Whether test-running was interrupted (e.g. because our tests timed out and we got SIGTERM'd)
+  // and when writing results we want to flush any pending tests as interrupted,
+  // rather than ignoring them because they're incomplete.
+  private final AtomicBoolean wasInterrupted = new AtomicBoolean();
 
   public BazelJUnitOutputListener(Path xmlOut) {
-    // Outputs from tests can be pretty large, so rather than hold them
-    // in memory, write to the output xml asap.
-
     try {
       Files.createDirectories(xmlOut.getParent());
       BufferedWriter writer = Files.newBufferedWriter(xmlOut, UTF_8);
@@ -45,62 +60,196 @@ public class BazelJUnitOutputListener implements TestExecutionListener, Closeabl
 
   @Override
   public void testPlanExecutionStarted(TestPlan testPlan) {
-    if (roots != null) {
-      throw new IllegalStateException("Test plan is currently executing");
-    }
+    this.testPlan = testPlan;
 
-    roots =
-        testPlan.getRoots().stream()
-            .map(root -> new RootContainer(root, testPlan))
-            .collect(
-                collectingAndThen(toCollection(LinkedHashSet::new), Collections::unmodifiableSet));
+    try {
+      // Closed when we call `testPlanExecutionFinished`
+      xml.writeStartElement("testsuites");
+    } catch (XMLStreamException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   @Override
   public void testPlanExecutionFinished(TestPlan testPlan) {
-    if (roots == null) {
+    if (this.testPlan == null) {
       throw new IllegalStateException("Test plan is not currently executing");
     }
 
     try {
-      xml.writeStartElement("testsuites");
-      roots.forEach(root -> root.toXml(xml));
+      // Closing `testsuites` element
       xml.writeEndElement();
     } catch (XMLStreamException e) {
       throw new RuntimeException(e);
-    } finally {
-      roots = null;
     }
+
+    this.testPlan = null;
+  }
+
+  // Requires the caller to have acquired resultsLock.
+  // Commented out to avoid adding a dependency to building the test runner.
+  // This is really just documentation until someone actually turns on a static analyser.
+  // If they do, we can decide whether we want to pick up the dependency.
+  // @GuardedBy("resultsLock")
+  private Map<TestData, List<TestData>> matchTestCasesToSuites_locked(
+      List<TestData> testCases, boolean includeIncompleteTests) {
+    Map<TestData, List<TestData>> knownSuites = new HashMap<>();
+
+    // Find the containing test suites for the test cases.
+    for (TestData testCase : testCases) {
+      TestData parent;
+
+      // The number of segments in the test case Unique ID depends upon the nature of the test:
+      // 3 segments : Simple tests (engine, class, method)
+      // 4 segments : Parameterized Tests (engine, class, template, invocation)
+      // 5 segments : Suite running simple tests (suite-engine, suite, engine, class, method)
+      // 6 segments : Suite running parameterized test (suite-engine, suite, engine, class,
+      // template, invocation)
+      // In all cases we're looking for the "class" segment, pull the UniqueID and map that from the
+      // results
+      List<UniqueId.Segment> segments = testCase.getId().getUniqueIdObject().getSegments();
+
+      if (segments.size() == 2) {
+        parent = results.get(testCase.getId().getUniqueIdObject());
+      } else if (segments.size() == 3 || segments.size() == 5) {
+        // get class / test data up one level
+        parent =
+            testCase
+                .getId()
+                .getParentIdObject()
+                .map(results::get)
+                .orElseThrow(NoSuchElementException::new);
+      } else if (segments.size() == 4 || segments.size() == 6) {
+        // get class / test data up two levels
+        parent =
+            testCase
+                .getId()
+                .getParentIdObject()
+                .map(results::get)
+                .orElseThrow(NoSuchElementException::new);
+        parent =
+            parent
+                .getId()
+                .getParentIdObject()
+                .map(results::get)
+                .orElseThrow(NoSuchElementException::new);
+      } else {
+        // Something is missing from our understanding of test organization,
+        // Ask people to send us a report about what we broke here.
+        LOG.warning("Unexpected test organization for " + testCase.getId());
+        throw new IllegalStateException(
+            "Unexpected test organization for test Case: " + testCase.getId());
+      }
+      if (includeIncompleteTests || testCase.getDuration() != null) {
+        knownSuites.computeIfAbsent(parent, id -> new ArrayList<>()).add(testCase);
+      }
+    }
+
+    return knownSuites;
+  }
+
+  // Requires the caller to have acquired resultsLock.
+  // Commented out to avoid adding a dependency to building the test runner.
+  // This is really just documentation until someone actually turns on a static analyser.
+  // If they do, we can decide whether we want to pick up the dependency.
+  // @GuardedBy("resultsLock")
+  private List<TestData> findTestCases_locked() {
+    return results.values().stream()
+        // Ignore test plan roots. These are always the engine being used.
+        .filter(result -> !testPlan.getRoots().contains(result.getId()))
+        .filter(
+            result -> {
+              // Find the test results we will convert to `testcase` entries. These
+              // are identified by the fact that they have no child test cases in the
+              // test plan, or they are marked as tests.
+              TestIdentifier id = result.getId();
+              return id.getSource() != null || id.isTest() || testPlan.getChildren(id).isEmpty();
+            })
+        .collect(Collectors.toList());
   }
 
   @Override
   public void dynamicTestRegistered(TestIdentifier testIdentifier) {
-    roots.forEach(root -> root.addDynamicTest(testIdentifier));
-  }
-
-  @Override
-  public void executionStarted(TestIdentifier testIdentifier) {
-    roots.forEach(root -> root.markStarted(testIdentifier));
+    getResult(testIdentifier).setDynamic(true);
   }
 
   @Override
   public void executionSkipped(TestIdentifier testIdentifier, String reason) {
-    roots.forEach(root -> root.markSkipped(testIdentifier, reason));
+    getResult(testIdentifier).mark(TestExecutionResult.aborted(null)).skipReason(reason);
+    outputIfTestRootIsComplete(testIdentifier);
+  }
+
+  @Override
+  public void executionStarted(TestIdentifier testIdentifier) {
+    getResult(testIdentifier).started();
   }
 
   @Override
   public void executionFinished(
       TestIdentifier testIdentifier, TestExecutionResult testExecutionResult) {
-    roots.forEach(root -> root.markFinished(testIdentifier, testExecutionResult));
+    getResult(testIdentifier).mark(testExecutionResult);
+    outputIfTestRootIsComplete(testIdentifier);
+  }
+
+  private void outputIfTestRootIsComplete(TestIdentifier testIdentifier) {
+    if (!testPlan.getRoots().contains(testIdentifier)) {
+      return;
+    }
+
+    output(false);
+  }
+
+  private void output(boolean includeIncompleteTests) {
+    synchronized (this.resultsLock) {
+      List<TestData> testCases = findTestCases_locked();
+      Map<TestData, List<TestData>> testSuites =
+          matchTestCasesToSuites_locked(testCases, includeIncompleteTests);
+
+      // Write the results
+      try {
+        for (Map.Entry<TestData, List<TestData>> suiteAndTests : testSuites.entrySet()) {
+          new TestSuiteXmlRenderer(testPlan)
+              .toXml(xml, suiteAndTests.getKey(), suiteAndTests.getValue());
+        }
+      } catch (XMLStreamException e) {
+        throw new RuntimeException(e);
+      }
+
+      // Delete the results we've used to conserve memory. This is safe to do
+      // since we only do this when the test root is complete, so we know that
+      // we won't be adding to the list of suites and test cases for that root
+      // (because tests and containers are arranged in a hierarchy --- the
+      // containers only complete when all the things they contain are
+      // finished. We are leaving all the test data that we have _not_ written
+      // to the XML file.
+      Stream.concat(testCases.stream(), testSuites.keySet().stream())
+          .forEach(data -> results.remove(data.getId().getUniqueIdObject()));
+    }
   }
 
   @Override
   public void reportingEntryPublished(TestIdentifier testIdentifier, ReportEntry entry) {
-    roots.forEach(root -> root.addReportingEntry(testIdentifier, entry));
+    getResult(testIdentifier).addReportEntry(entry);
   }
 
-  @Override
+  private TestData getResult(TestIdentifier id) {
+    synchronized (resultsLock) {
+      return results.computeIfAbsent(id.getUniqueIdObject(), ignored -> new TestData(id));
+    }
+  }
+
+  public void closeForInterrupt() {
+    wasInterrupted.set(true);
+    close();
+  }
+
   public void close() {
+    if (hasClosed.getAndSet(true)) {
+      return;
+    }
+    if (wasInterrupted.get()) {
+      output(true);
+    }
     try {
       xml.writeEndDocument();
       xml.close();

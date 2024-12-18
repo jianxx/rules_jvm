@@ -2,16 +2,14 @@ load("@bazel_gazelle//:def.bzl", "gazelle_binary", "gazelle_generation_test")
 
 # It's important not to add any BUILD.bazel files in any subdirectory of this one. If you find tests failing which look like files are missing, it's likely a BUILD.bazel file has accidentally been added.
 
-# We don't want gazelle to run on this directory or its children, as having BUILD.bazel files would stop the test_data globs from reaching into the directories.
-# gazelle:exclude
+# We don't want gazelle to run on this directory's children, as having BUILD.bazel files would stop the test_data globs from reaching into the directories.
+# We do, however, want to include this BUILD.bazel file in Gazelle's knowledge, otherwise gazelle will view this directory as not being a package and will include testdata/** as a `data` glob in the parent's test target.
+# This causes problems when running Bazel with `--incompatible_disallow_empty_glob`.
+# gazelle:exclude *
 
 gazelle_binary(
     name = "gazelle",
     languages = [
-        # Register a fake language which makes timestamps consistent via static initializers.
-        # Otherwise we end up with stderr diffs every time we run the tests beacuse of timestamps.
-        # (Yes, this is a horrible hack).
-        "//java/gazelle/private/testutil/reset_zerolog_timestamps",
         "@bazel_gazelle//language/proto:go_default_library",
         "//java/gazelle",
     ],
@@ -29,11 +27,25 @@ gazelle_binary(
 # `cd subdir && for f in $(fd BUILD.out); do mv ${f} $(dirname ${f})/BUILD.bazel; done && bazel run @unpinned_maven//:pin && rm -rf bazel-* && for f in $(fd BUILD.bazel); do mv ${f} $(dirname ${f})/BUILD.out; done`
 #
 # Other tests just use `gazelle:resolve` comments to resolve maven artifacts, or just don't (and get warnings to stderr as a result.
+
+SKIPPED_ON_WINDOWS = [
+    "lib_with_invalid_label_in_runtime_deps",
+    "lib_with_runtime_deps_and_map_kind",
+    "maven_with_collision_and_resolve",
+    "module_granularity_with_sources",
+]
+
 [
     gazelle_generation_test(
         name = file[0:-len("/WORKSPACE")],
+        env = {
+            "GAZELLE_JAVA_LOG_CALLER": "false",
+            "GAZELLE_JAVA_LOG_FORMAT": "json",
+            "GAZELLE_JAVA_LOG_TIMESTAMP": "false",
+        },
         gazelle_binary = ":gazelle",
         gazelle_timeout_seconds = 30,
+        tags = ["skip-windows"] if file[0:-len("/WORKSPACE")] in SKIPPED_ON_WINDOWS else [],
         test_data = glob(
             include = [file[0:-len("/WORKSPACE")] + "/**"],
         ),

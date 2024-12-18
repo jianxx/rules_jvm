@@ -8,6 +8,7 @@ import (
 	"github.com/bazel-contrib/rules_jvm/java/gazelle/javaconfig"
 	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/javaparser"
 	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/maven"
+	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/types"
 	"github.com/bazelbuild/bazel-gazelle/config"
 	"github.com/bazelbuild/bazel-gazelle/rule"
 	bzl "github.com/bazelbuild/buildtools/build"
@@ -20,6 +21,7 @@ import (
 type Configurer struct {
 	lang                  *javaLang
 	annotationToAttribute annotationToAttribute
+	annotationToWrapper   annotationToWrapper
 	mavenInstallFile      string
 }
 
@@ -27,11 +29,13 @@ func NewConfigurer(lang *javaLang) *Configurer {
 	return &Configurer{
 		lang:                  lang,
 		annotationToAttribute: make(annotationToAttribute),
+		annotationToWrapper:   make(annotationToWrapper),
 	}
 }
 
 func (jc *Configurer) RegisterFlags(fs *flag.FlagSet, cmd string, c *config.Config) {
 	fs.Var(&jc.annotationToAttribute, "java-annotation-to-attribute", "Mapping of annotations (on test classes) to attributes which should be set for that test rule. Examples: com.example.annotations.FlakyTest=flaky=True com.example.annotations.SlowTest=timeout=\"long\"")
+	fs.Var(&jc.annotationToWrapper, "java-annotation-to-wrapper", "Mapping of annotations (on test classes) to wrapper rules which should be used around the test rule. Example: com.example.annotations.RequiresNetwork=@some//wrapper:file.bzl=requires_network")
 	fs.StringVar(&jc.mavenInstallFile, "java-maven-install-file", "", "Path of the maven_install.json file. Defaults to \"maven_install.json\".")
 }
 
@@ -41,6 +45,9 @@ func (jc *Configurer) CheckFlags(fs *flag.FlagSet, c *config.Config) error {
 		for k, v := range kv {
 			cfgs[""].MapAnnotationToAttribute(annotation, k, v)
 		}
+	}
+	for annotation, wrapper := range jc.annotationToWrapper {
+		cfgs[""].MapAnnotationToWrapper(annotation, wrapper.symbol)
 	}
 	if jc.mavenInstallFile != "" {
 		cfgs[""].SetMavenInstallFile(jc.mavenInstallFile)
@@ -57,6 +64,8 @@ func (jc *Configurer) KnownDirectives() []string {
 		javaconfig.JavaTestFileSuffixes,
 		javaconfig.JavaTestMode,
 		javaconfig.JavaGenerateProto,
+		javaconfig.JavaMavenRepositoryName,
+		javaconfig.JavaAnnotationProcessorPlugin,
 	}
 }
 
@@ -109,6 +118,9 @@ func (jc *Configurer) Configure(c *config.Config, rel string, f *rule.File) {
 			case javaconfig.JavaTestMode:
 				cfg.SetTestMode(d.Value)
 
+			case javaconfig.JavaMavenRepositoryName:
+				cfg.SetMavenRepositoryName(d.Value)
+
 			case javaconfig.JavaGenerateProto:
 				switch d.Value {
 				case "true":
@@ -119,6 +131,21 @@ func (jc *Configurer) Configure(c *config.Config, rel string, f *rule.File) {
 					jc.lang.logger.Fatal().Msgf("invalid value for directive %q: %s: possible values are true/false",
 						javaconfig.JavaGenerateProto, d.Value)
 				}
+			case javaconfig.JavaAnnotationProcessorPlugin:
+				// Format: # gazelle:java_annotation_processor_plugin com.example.AnnotationName com.example.AnnotationProcessorImpl
+				parts := strings.Split(d.Value, " ")
+				if len(parts) != 2 {
+					jc.lang.logger.Fatal().Msgf("invalid value for directive %q: %s: expected an annotation class-name followed by a processor class-name", javaconfig.JavaAnnotationProcessorPlugin, d.Value)
+				}
+				annotationClassName, err := types.ParseClassName(parts[0])
+				if err != nil {
+					jc.lang.logger.Fatal().Msgf("invalid value for directive %q: %q: couldn't parse annotation processor annotation class-name: %v", javaconfig.JavaAnnotationProcessorPlugin, parts[0], err)
+				}
+				processorClassName, err := types.ParseClassName(parts[1])
+				if err != nil {
+					jc.lang.logger.Fatal().Msgf("invalid value for directive %q: %q: couldn't parse annotation processor class-name: %v", javaconfig.JavaAnnotationProcessorPlugin, parts[1], err)
+				}
+				cfg.AddAnnotationProcessorPlugin(*annotationClassName, *processorClassName)
 			}
 		}
 	}
@@ -134,7 +161,6 @@ func (jc *Configurer) Configure(c *config.Config, rel string, f *rule.File) {
 	if jc.lang.mavenResolver == nil {
 		resolver, err := maven.NewResolver(
 			cfg.MavenInstallFile(),
-			cfg.ExcludedArtifacts(),
 			jc.lang.logger,
 		)
 		if err != nil {
@@ -187,5 +213,49 @@ func (f *annotationToAttribute) Set(value string) error {
 	}
 
 	(*f)[annotationClassName][key] = parsedValue
+	return nil
+}
+
+type loadInfo struct {
+	from   string
+	symbol string
+}
+
+type annotationToWrapper map[string]loadInfo
+
+func (f *annotationToWrapper) String() string {
+	s := "annotationToWrapper{"
+	for a, li := range *f {
+		s += a + ": "
+		s += fmt.Sprintf(`load("%s", "%s")`, li.from, li.symbol)
+	}
+	s += "}"
+	return s
+}
+
+func (f *annotationToWrapper) Set(value string) error {
+	parts := strings.Split(value, "=")
+	if len(parts) != 2 {
+		return fmt.Errorf("want --java-annotation-to-wrapper to have format com.example.RequiresNetwork=@some_repo//has:wrapper.bzl,wrapper_rule but didn't see exactly one equals sign")
+	}
+	annotation := parts[0]
+
+	if _, ok := (*f)[annotation]; ok {
+		return fmt.Errorf("saw conflicting values for --java-annotation-to-wrapper flag for annotation %v", annotation)
+	}
+
+	vParts := strings.Split(parts[1], ",")
+	if len(vParts) != 2 {
+		return fmt.Errorf("want --java-annotation-to-wrapper to have format com.example.RequiresNetwork=@some_repo//has:wrapper.bzl,wrapper_rule but didn't see exactly one comma after equals sign")
+	}
+
+	from := vParts[0]
+	symbol := vParts[1]
+
+	(*f)[annotation] = loadInfo{
+		from:   from,
+		symbol: symbol,
+	}
+
 	return nil
 }

@@ -7,8 +7,10 @@ import com.gazelle.java.javaparser.v0.Package;
 import com.gazelle.java.javaparser.v0.Package.Builder;
 import com.gazelle.java.javaparser.v0.ParsePackageRequest;
 import com.gazelle.java.javaparser.v0.PerClassMetadata;
+import com.gazelle.java.javaparser.v0.PerFieldMetadata;
+import com.gazelle.java.javaparser.v0.PerMethodMetadata;
+import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Iterables;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
@@ -25,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedSet;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -103,10 +106,7 @@ public class GrpcServer {
         responseObserver.onNext(getImports(request));
         responseObserver.onCompleted();
       } catch (Exception ex) {
-        logger.error(
-            "Got Exception parsing package {}: {}", Paths.get(request.getRel()), ex.getMessage());
         responseObserver.onError(ex);
-        responseObserver.onCompleted();
       } finally {
         timeoutHandler.finishedRequest();
       }
@@ -132,11 +132,11 @@ public class GrpcServer {
       }
       Set<String> packages = parser.getPackages();
       if (packages.size() > 1) {
-        logger.error(
-            "Set of classes in {} should have only one package, instead is: {}",
-            request.getRel(),
-            packages);
-        throw new StatusRuntimeException(Status.INVALID_ARGUMENT);
+        throw new StatusRuntimeException(
+            Status.INVALID_ARGUMENT.withDescription(
+                String.format(
+                    "Expected exactly one java package, but saw %d: %s",
+                    packages.size(), Joiner.on(", ").join(packages))));
       } else if (packages.isEmpty()) {
         logger.info(
             "Set of classes in {} has no package", Paths.get(request.getRel()).toAbsolutePath());
@@ -156,13 +156,28 @@ public class GrpcServer {
               .addAllImportedPackagesWithoutSpecificClasses(
                   parser.getUsedPackagesWithoutSpecificTypes())
               .addAllMains(parser.getMainClasses());
-      for (Map.Entry<String, ImmutableSortedSet<String>> annotations :
-          parser.getAnnotatedClasses().entrySet()) {
-        packageBuilder.putPerClassMetadata(
-            annotations.getKey(),
+      for (Map.Entry<String, ClasspathParser.PerClassData> classEntry :
+          parser.perClassData.entrySet()) {
+        PerClassMetadata.Builder perClassMetadata =
             PerClassMetadata.newBuilder()
-                .addAllAnnotationClassNames(annotations.getValue())
-                .build());
+                .addAllAnnotationClassNames(classEntry.getValue().annotations);
+        for (Map.Entry<String, SortedSet<String>> methodEntry :
+            classEntry.getValue().perMethodAnnotations.entrySet()) {
+          perClassMetadata.putPerMethodMetadata(
+              methodEntry.getKey(),
+              PerMethodMetadata.newBuilder()
+                  .addAllAnnotationClassNames(methodEntry.getValue())
+                  .build());
+        }
+        for (Map.Entry<String, SortedSet<String>> fieldEntry :
+            classEntry.getValue().perFieldAnnotations.entrySet()) {
+          perClassMetadata.putPerFieldMetadata(
+              fieldEntry.getKey(),
+              PerFieldMetadata.newBuilder()
+                  .addAllAnnotationClassNames(fieldEntry.getValue())
+                  .build());
+        }
+        packageBuilder.putPerClassMetadata(classEntry.getKey(), perClassMetadata.build());
       }
       return packageBuilder.build();
     }

@@ -1,0 +1,41 @@
+name: Tests (Windows)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  # We don't run the tests in the main test job because most of them don't work on Windows, but the Gazelle ones should, so we run those.
+  test_windows:
+    strategy:
+      matrix:
+        runs-on:
+          - windows-latest
+
+    runs-on: ${{ matrix.runs-on }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      # The windows-latest image comes with Java 8 but rules_jvm_external requires at least 11, so we install a newer JDK.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "21"
+
+      - uses: bazel-contrib/setup-bazel@0.8.5
+        with:
+          # Avoid downloading Bazel every time.
+          bazelisk-cache: true
+          # Store build cache per workflow.
+          disk-cache: true
+          # Share repository cache between workflows.
+          repository-cache: true
+
+      - name: bzlmod gazelle
+        # Ignoring the handful of tests that are failing without other changes for now
+        run: bazelisk --bazelrc=.github/workflows/ci.bazelrc test --test_tag_filters=-skip-windows //java/gazelle/...

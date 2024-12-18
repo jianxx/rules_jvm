@@ -2,9 +2,12 @@ package javaconfig
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
 	"strings"
 
+	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/sorted_set"
+	"github.com/bazel-contrib/rules_jvm/java/gazelle/private/types"
 	bzl "github.com/bazelbuild/buildtools/build"
 )
 
@@ -42,6 +45,14 @@ const (
 	// rules when a `proto_library` rule is present.
 	// Can be either "true" or "false". Defaults to "true".
 	JavaGenerateProto = "java_generate_proto"
+
+	// JavaMavenRepositoryName tells the code generator what the repository name that contains all maven dependencies is.
+	// Defaults to "maven"
+	JavaMavenRepositoryName = "java_maven_repository_name"
+
+	// JavaAnnotationProcessorPlugin tells the code generator about specific java_plugin targets needed to process
+	// specific annotations.
+	JavaAnnotationProcessorPlugin = "java_annotation_processor_plugin"
 )
 
 // Configs is an extension of map[string]*Config. It provides finding methods
@@ -51,6 +62,14 @@ type Configs map[string]*Config
 // NewChild creates a new child Config. It inherits desired values from the
 // current Config and sets itself as the parent to the child.
 func (c *Config) NewChild() *Config {
+	clonedExcludedArtifacts := make(map[string]struct{})
+	for key, value := range c.excludedArtifacts {
+		clonedExcludedArtifacts[key] = value
+	}
+	annotationProcessorFullQualifiedClassToPluginClass := make(map[string]*sorted_set.SortedSet[types.ClassName])
+	for key, value := range c.annotationProcessorFullQualifiedClassToPluginClass {
+		annotationProcessorFullQualifiedClassToPluginClass[key] = value.Clone()
+	}
 	return &Config{
 		parent:                 c,
 		extensionEnabled:       c.extensionEnabled,
@@ -62,12 +81,16 @@ func (c *Config) NewChild() *Config {
 		testMode:               c.testMode,
 		customTestFileSuffixes: c.customTestFileSuffixes,
 		annotationToAttribute:  c.annotationToAttribute,
+		annotationToWrapper:    c.annotationToWrapper,
+		excludedArtifacts:      clonedExcludedArtifacts,
+		mavenRepositoryName:    c.mavenRepositoryName,
+		annotationProcessorFullQualifiedClassToPluginClass: annotationProcessorFullQualifiedClassToPluginClass,
 	}
 }
 
 // ParentForPackage returns the parent Config for the given Bazel package.
 func (c *Configs) ParentForPackage(pkg string) *Config {
-	dir := filepath.Dir(pkg)
+	dir := path.Dir(pkg)
 	if dir == "." {
 		dir = ""
 	}
@@ -79,16 +102,19 @@ func (c *Configs) ParentForPackage(pkg string) *Config {
 type Config struct {
 	parent *Config
 
-	extensionEnabled       bool
-	isModuleRoot           bool
-	generateProto          bool
-	mavenInstallFile       string
-	moduleGranularity      string
-	repoRoot               string
-	testMode               string
-	customTestFileSuffixes *[]string
-	excludedArtifacts      map[string]struct{}
-	annotationToAttribute  map[string]map[string]bzl.Expr
+	extensionEnabled                                   bool
+	isModuleRoot                                       bool
+	generateProto                                      bool
+	mavenInstallFile                                   string
+	moduleGranularity                                  string
+	repoRoot                                           string
+	testMode                                           string
+	customTestFileSuffixes                             *[]string
+	excludedArtifacts                                  map[string]struct{}
+	annotationToAttribute                              map[string]map[string]bzl.Expr
+	annotationToWrapper                                map[string]string
+	mavenRepositoryName                                string
+	annotationProcessorFullQualifiedClassToPluginClass map[string]*sorted_set.SortedSet[types.ClassName]
 }
 
 type LoadInfo struct {
@@ -109,6 +135,9 @@ func New(repoRoot string) *Config {
 		customTestFileSuffixes: nil,
 		excludedArtifacts:      make(map[string]struct{}),
 		annotationToAttribute:  make(map[string]map[string]bzl.Expr),
+		annotationToWrapper:    make(map[string]string),
+		mavenRepositoryName:    "maven",
+		annotationProcessorFullQualifiedClassToPluginClass: make(map[string]*sorted_set.SortedSet[types.ClassName]),
 	}
 }
 
@@ -132,6 +161,14 @@ func (c *Config) GenerateProto() bool {
 
 func (c *Config) SetGenerateProto(generate bool) {
 	c.generateProto = generate
+}
+
+func (c *Config) MavenRepositoryName() string {
+	return c.mavenRepositoryName
+}
+
+func (c *Config) SetMavenRepositoryName(name string) {
+	c.mavenRepositoryName = name
 }
 
 func (c Config) MavenInstallFile() string {
@@ -222,6 +259,39 @@ func (c *Config) MapAnnotationToAttribute(annotation string, key string, value b
 func (c *Config) AttributesForAnnotation(annotation string) (map[string]bzl.Expr, bool) {
 	m, ok := c.annotationToAttribute[annotation]
 	return m, ok
+}
+
+func (c *Config) MapAnnotationToWrapper(annotation string, wrapper string) {
+	c.annotationToWrapper[annotation] = wrapper
+}
+
+func (c *Config) WrapperForAnnotation(annotation string) (string, bool) {
+	s, ok := c.annotationToWrapper[annotation]
+	return s, ok
+}
+
+func (c *Config) IsTestRule(ruleKind string) bool {
+	if ruleKind == "java_junit5_test" || ruleKind == "java_test" || ruleKind == "java_test_suite" {
+		return true
+	}
+	for _, wrapper := range c.annotationToWrapper {
+		if ruleKind == wrapper {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Config) GetAnnotationProcessorPluginClasses(annotationClass types.ClassName) *sorted_set.SortedSet[types.ClassName] {
+	return c.annotationProcessorFullQualifiedClassToPluginClass[annotationClass.FullyQualifiedClassName()]
+}
+
+func (c *Config) AddAnnotationProcessorPlugin(annotationClass types.ClassName, processorClass types.ClassName) {
+	fullyQualifiedAnnotationClass := annotationClass.FullyQualifiedClassName()
+	if _, ok := c.annotationProcessorFullQualifiedClassToPluginClass[fullyQualifiedAnnotationClass]; !ok {
+		c.annotationProcessorFullQualifiedClassToPluginClass[fullyQualifiedAnnotationClass] = sorted_set.NewSortedSetFn[types.ClassName](nil, types.ClassNameLess)
+	}
+	c.annotationProcessorFullQualifiedClassToPluginClass[fullyQualifiedAnnotationClass].Add(processorClass)
 }
 
 func equalStringSlices(l, r []string) bool {
